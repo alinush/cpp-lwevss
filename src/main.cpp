@@ -1,5 +1,5 @@
-/* main.cpp - a "main" file, just a debugging tool
- * 
+/* main.cpp - PVSS dealing benchmark (fresh deal, no re-share scaffolding).
+ *
  * Copyright (C) 2021, LWE-PVSS
  *
  * Permission is hereby granted, free of charge, to any person obtaining
@@ -9,10 +9,10 @@
  * distribute, sublicense, and/or sell copies of the Software, and to
  * permit persons to whom the Software is furnished to do so, subject
  * to the following conditions:
- * 
+ *
  * The above copyright notice and this permission notice shall be included
  * in all copies or substantial portions of the Software.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
  * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
@@ -21,9 +21,7 @@
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
  * OTHER DEALINGS IN THE SOFTWARE.
  **/
- 
-// This file is just a convenience, a handy tool that lets us run
-// small porgrams without having to use the awkward ctest syntax.
+
 #include <cassert>
 #include <cmath>
 #include <random>
@@ -36,29 +34,31 @@ using namespace std;
 #include <NTL/version.h>
 #include "regevEnc.hpp"
 #include "regevProofs.hpp"
+#include "bulletproof.hpp"
 
 using namespace ALGEBRA;
 using namespace REGEVENC;
 
 int main(int argc, char** argv) {
-    // std::cout << "- Found GMP version "<<__GNU_MP__ <<std::endl;
-    // std::cout << "- Found NTL version "<<NTL_VERSION <<std::endl;
-    // std::cout << "- Found Sodium version "<<SODIUM_VERSION_STRING<<std::endl;
-
     int nParties = 512;
-    if (argc > 1) {
-        nParties = std::stoi(argv[1]);
-    }
-    if (nParties < 32 || nParties > 4096)
-        nParties = 512;
-    std::cout << "nParties="<<nParties << std::endl;
+    if (argc > 1) nParties = std::stoi(argv[1]);
+    int tOverride = -1;
+    if (argc > 2) tOverride = std::stoi(argv[2]);
 
-    // The dimensions of the the CRX is k-by-m, but note that this is a
-    // matrix over GF(p^2) so the lattice dimensions we get is twice that
+    std::cout << "nParties="<<nParties;
+    if (tOverride > 0) std::cout << " threshold="<<tOverride;
+    std::cout << std::endl;
+
     KeyParams kp(nParties);
-    // kp.k=64;
     GlobalKey gpk("testContext", kp);
-    std::cout <<"{ kay:"<<gpk.kay<<", enn:"<<gpk.enn
+    if (tOverride > 0) gpk.tee = tOverride;
+    if (gpk.tee <= 0) {
+        std::cerr << "tee=" << gpk.tee << " after construction/override; "
+                     "pass t explicitly on the command line for small n "
+                     "(the default formula ((n-1)/(2*ell))*ell yields 0)\n";
+        return 1;
+    }
+    std::cout <<"{ kay:"<<gpk.kay<<", enn:"<<gpk.enn<<", tee:"<<gpk.tee
       <<", sigmaEnc1:"<<gpk.sigmaEnc1<<", sigmaEnc2:"<<gpk.sigmaEnc2<<" }\n";
 
     TernaryEMatrix::init();
@@ -68,10 +68,7 @@ int main(int argc, char** argv) {
     VerifierData vd(gpk, ped, mer, ssp);
     ProverData pd(vd);
 
-    // Generate/verify the proofs by the second party (idx=1)
-    int partyIdx = 1;
-
-    // Key generation for all the parties
+    // --- Key generation for all n parties (the dealer needs B = stack of all pk's) ---
     std::vector<ALGEBRA::EVector> kgNoise(gpk.enn);
     std::vector<ALGEBRA::EVector> sk(gpk.enn);
     std::vector<ALGEBRA::EVector> pk(gpk.enn);
@@ -87,217 +84,186 @@ int main(int argc, char** argv) {
     std::cout <<gpk.enn<<" keyGens in "<<ticks<<" milliseconds, avg="<<(ticks/double(gpk.enn))
         << " ("<< (crsTicks/double(gpk.enn)) << " for s x A)\n";
 
-    // encryption
-    std::vector<ALGEBRA::SVector> ptxt1(gpk.enn);
-    std::vector<GlobalKey::CtxtPair> ctxt1(gpk.enn);
-    // secret sharing of a random value , the secret itself is sshr[0]
+    // --- Fresh PVSS dealing ---
+    // The dealer picks a random degree-(t-1) polynomial p, and ptxt[j-1] = p(j).
+    // ssp.randomSharing fills sshr[0]=secret=p(0), sshr[i]=p(i) for i=1..n.
     ALGEBRA::SVector sshr;
     ssp.randomSharing(sshr);
-    for (int i=0; i<gpk.enn; i++) {
-        resize(ptxt1[i], gpk.enn);
-        for (int j=0; j<gpk.enn; j++) ptxt1[i][j] = sshr[i+1];
-    }
-    start = chrono::steady_clock::now();
-    crsTicks = 0;
-    for (int i=0; i<gpk.enn; i++) {
-        ctxt1[i] = gpk.encrypt(ptxt1[i]);
-    }
-    end = chrono::steady_clock::now();
-    ticks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-    std::cout <<gpk.enn<<" encryptions in "<<ticks<<" milliseconds, avg="<<(ticks/double(gpk.enn)) 
-        << " ("<< (crsTicks/double(gpk.enn)) << " for A x r)\n";
 
-    // decryption at party #1
-    ALGEBRA::SVector ptxt2;    resize(ptxt2, gpk.tee);
-    ALGEBRA::EVector decNoise; resize(decNoise, gpk.tee);
-    start = chrono::steady_clock::now();
-    for (int i=0; i<gpk.tee; i++) { // decrypt 2nd entry in i'th ctxt
-        ptxt2[i] = gpk.decrypt(sk[partyIdx], partyIdx, ctxt1[i], &(decNoise[i]));
-    }
-    end = chrono::steady_clock::now();
-    ticks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-    std::cout << gpk.tee << " decryptions in "<<ticks<< " milliseconds, avg="
-        << (ticks/double(gpk.tee)) << std::endl;
+    ALGEBRA::SVector ptxt;   // n-vector of shares: ptxt[j-1] = sshr[j] = p(j)
+    resize(ptxt, gpk.enn);
+    for (int j=0; j<gpk.enn; j++) ptxt[j] = sshr[j+1];
 
-    for (int i=0; i<gpk.tee; i++) { // decrypt 2nd entry in i'th ctxt
-        if (ptxt2[i] != ptxt1[i][partyIdx])
-            std::cout << "decryption error in "<<i<<"th ciphertext\n";
-    }
-
-    // re-encryption at party #1
-    ALGEBRA::SVector ptxt3;
-    resize(ptxt3, gpk.enn);
-    for (int j=0; j<gpk.enn; j++) ptxt3[j] = sshr[j+1];
+    // Time the single dealer encryption (this IS the PVSS dealing).
     ALGEBRA::EVector encRnd;
     REGEVENC::GlobalKey::CtxtPair eNoise;
-    auto ctxt2 = gpk.encrypt(ptxt3, encRnd, eNoise);
-
-    // Copy the first t ciphertexts into a k x t matrix and another t-vector
-    EMatrix ctxtMat;
-    resize(ctxtMat, gpk.kay, gpk.tee);
-    EVector ctxtVec;
-    resize(ctxtVec, gpk.tee);
-    for (int i=0; i<gpk.tee; i++) {
-        for (int j=0; j<gpk.kay; j++)
-            ctxtMat[j][i] = ctxt1[i].first[j];
-        ctxtVec[i] = ctxt1[i].second[partyIdx];
-    }
-
-    // prepare for proof, commit to the secret key
-    DLPROOFS::Point::counter = 0;
-    DLPROOFS::Point::timer = 0;
-    int origSize = sk[partyIdx].length(); 
-   
-    vd.sk1Com = commit(sk[partyIdx], vd.sk1Idx, vd.Gs, pd.sk1Rnd);
-
     start = chrono::steady_clock::now();
-    SVector lagrange = vd.sp->lagrangeCoeffs(interval(1,gpk.tee+1));
-
-    crsTicks = 0;
-    proveDecryption(pd, ctxtMat, ctxtVec, ptxt2, sk[partyIdx], decNoise);
-    proveEncryption(pd, ctxt2.first, ctxt2.second, ptxt3, encRnd, eNoise.first, eNoise.second);
-    proveKeyGen(pd, partyIdx, sk[partyIdx], kgNoise[partyIdx]);
-    proveReShare(pd, lagrange, ptxt2, ptxt3);
-    proveSmallness(pd);
-
+    auto ctxt = gpk.encrypt(ptxt, encRnd, eNoise);
     end = chrono::steady_clock::now();
     ticks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-    std::cout << "preparing to prove and committing in "<<ticks<< " milliseconds, "
-        << DLPROOFS::Point::counter << " exponentiations in "
-        << ((500+DLPROOFS::Point::timer)/1000) << " milliseconds"
-        << " ("<< crsTicks << " for xR x A)\n";
+    std::cout <<"encryption in "<<ticks<<" milliseconds\n";
 
-    // aggregate the constraints and flatten everything before proving
-    DLPROOFS::Point::counter = 0;
-    DLPROOFS::Point::timer = 0;
-    std::cout<<"aggregting constraints\n";
+    // --- Decrypt-share benchmark (party 0 pulls its own share out of the dealing) ---
+    // In GHL21e, decrypt-share is one lattice decryption: sshr[partyIdx+1] = ptxt[partyIdx].
+    int partyIdx = 0;
+    ALGEBRA::Element decNoiseElt;
+    start = chrono::steady_clock::now();
+    ALGEBRA::Scalar myShare = gpk.decrypt(sk[partyIdx], partyIdx, ctxt, &decNoiseElt);
+    end = chrono::steady_clock::now();
+    auto decryptUs = chrono::duration_cast<chrono::microseconds>(end - start).count();
+    std::cout <<"decryption in "<<(decryptUs/1000.0)<<" milliseconds\n";
+    if (myShare != ptxt[partyIdx])
+        std::cout << "decryption error\n";
+
+    // --- Set up pt1 witness for the Shamir-structure proof (proveReShare) ---
+    // proveReShare's parity-check constraint is H*[Σⱼ lagrange[j]·pt1[j], pt2[0..n-1]] = 0.
+    // With pt1 = first t entries of ptxt, Σⱼ lagrange[j]·pt1[j] = p(0) = secret,
+    // so the parity check holds iff the full n-vector ptxt lies on a degree-(t-1)
+    // polynomial — which is exactly the Shamir-structure property a PVSS transcript
+    // must prove.
+    ALGEBRA::SVector pt1;
+    resize(pt1, gpk.tee);
+    for (int j=0; j<gpk.tee; j++) pt1[j] = ptxt[j];
+    vd.pt1Com = commit(pt1, vd.pt1Idx, vd.Gs, pd.pt1Rnd);
+    vd.mer->processPoint("RegevDecPtxt", vd.pt1Com);
+    addSVec2Map(pd.linWitness, pt1, vd.pt1Idx);
+
+    // Populate zero-valued witnesses at indices that proveDecryption and proveKeyGen
+    // would normally fill. We skip those proofs (they're re-share / one-time-setup
+    // specific and not part of a fresh PVSS deal), but the aggregated constraint
+    // system still references those indices inside proveSmallness (which does
+    // expandConstraints from index 0) and the Shamir parity check. Without these
+    // zero placeholders, aggregateProver's witness-trimming loop cascades and erases
+    // all witnesses whenever it hits an index missing from linWitness.
+    {
+        int skLen = gpk.kay * GlobalKey::ell;
+        auto fillZeros = [&](int startIdx, int len) {
+            CRV25519::Scalar zero;
+            for (int i=0; i<len; i++) pd.linWitness[startIdx + i] = zero;
+        };
+        fillZeros(vd.sk1Idx, skLen);
+        fillZeros(vd.sk2Idx, skLen);
+        fillZeros(vd.dCompHiIdx, JLDIM);
+        fillZeros(vd.dPadHiIdx, PAD_SIZE);
+        fillZeros(vd.dCompLoIdx, JLDIM);
+        fillZeros(vd.dPadLoIdx, PAD_SIZE);
+        fillZeros(vd.sk2CompIdx, JLDIM);
+        fillZeros(vd.sk2PadIdx, PAD_SIZE);
+        fillZeros(vd.kCompHiIdx, JLDIM);
+        fillZeros(vd.kPadHiIdx, PAD_SIZE);
+        fillZeros(vd.kCompLoIdx, JLDIM);
+        fillZeros(vd.kPadLoIdx, PAD_SIZE);
+    }
+
+    // --- Proof generation (dealer side) ---
+    auto stepStart = chrono::steady_clock::now();
+    proveEncryption(pd, ctxt.first, ctxt.second, ptxt, encRnd, eNoise.first, eNoise.second);
+    auto stepEnd = chrono::steady_clock::now();
+    auto proveEncryptionTicks =
+        chrono::duration_cast<chrono::milliseconds>(stepEnd - stepStart).count();
+    std::cout << "proveEncryption in "<<proveEncryptionTicks<<" milliseconds\n";
+
+    stepStart = chrono::steady_clock::now();
+    SVector lagrange = vd.sp->lagrangeCoeffs(interval(1,gpk.tee+1));
+    proveReShare(pd, lagrange, pt1, ptxt);
+    stepEnd = chrono::steady_clock::now();
+    auto proveShamirTicks =
+        chrono::duration_cast<chrono::milliseconds>(stepEnd - stepStart).count();
+    std::cout << "proveShamir in "<<proveShamirTicks<<" milliseconds\n";
+
+    stepStart = chrono::steady_clock::now();
+    proveSmallness(pd);
+    stepEnd = chrono::steady_clock::now();
+    auto proveSmallnessTicks =
+        chrono::duration_cast<chrono::milliseconds>(stepEnd - stepStart).count();
+    std::cout << "proveSmallness in "<<proveSmallnessTicks<<" milliseconds\n";
+
+    // Aggregate linear/quadratic constraints into a single pair of bulletproof statements.
     start = chrono::steady_clock::now();
     ReadyToProve rtp;
     rtp.aggregateProver(pd);
 
-    // Make copies of the Merlin transcripts and specialize them
-    // for the final constraints before proving/verifying them
     auto merLin = *vd.mer;
     merLin.processConstraint("linear", rtp.linCnstr);
-
     auto merQuad = *vd.mer;
     merQuad.processConstraint("quadratic", rtp.quadCnstr);
 
-    // Flatten the statements, this relases the memory of the constraints
-    // (hence the Merlin processing above must be done before doing this).
-    std::cout<<"flatenning constraints\n";
     rtp.flattenLinPrv(pd);
     rtp.flattenQuadPrv(pd);
 
-    ReadyToVerify rtv = rtp; // a copy without the secret variables
+    ReadyToVerify rtv = rtp; // copy without the secret variables
 
-    // prove and verify the linear statement
-    auto merLinVer = merLin; // another copy for verification
+    auto merLinVer = merLin;
     DLPROOFS::LinPfTranscript pfL("Linear");
     pfL.C = rtp.linCom;
 
     end = chrono::steady_clock::now();
-    ticks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-    std::cout << "aggregating constaints in "<<ticks<< " milliseconds, "
-        << DLPROOFS::Point::counter << " exponentiations in "
-        << ((500+DLPROOFS::Point::timer)/1000) << " milliseconds\n";
+    auto aggregateTicks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+    std::cout << "aggregate in "<<aggregateTicks<<" milliseconds\n";
 
-    // The actual proof
-    DLPROOFS::Point::counter = 0;
-    DLPROOFS::Point::timer = 0;
+    // Linear bulletproof
     start = chrono::steady_clock::now();
     DLPROOFS::proveLinear(pfL, rtp.lComRnd, merLin, rtp.linWtns.data(),
             rtp.linStmnt.data(), rtp.linGs.data(), rtp.linGs.size());
     end = chrono::steady_clock::now();
-    ticks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-    std::cout << "proving linear in "<<ticks<< " milliseconds, "
-        << DLPROOFS::Point::counter << " exponentiations in "
-        << ((500+DLPROOFS::Point::timer)/1000) << " milliseconds\n";
+    auto proveLinTicks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+    std::cout << "proveLinear in "<<proveLinTicks<<" milliseconds\n";
 
-    DLPROOFS::Point::counter = 0;
-    DLPROOFS::Point::timer = 0;
     start = chrono::steady_clock::now();
-    if (!DLPROOFS::verifyLinear(pfL, rtv.linStmnt.data(), rtv.linGs.data(),
-                      rtv.linGs.size(), rtv.linCnstr.equalsTo, merLinVer))
-        std::cout << "failed linear verification\n";
+    bool linOK = DLPROOFS::verifyLinear(pfL, rtv.linStmnt.data(), rtv.linGs.data(),
+                      rtv.linGs.size(), rtv.linCnstr.equalsTo, merLinVer);
     end = chrono::steady_clock::now();
-    ticks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-    std::cout << "verifying linear in "<<ticks<< " milliseconds, "
-        << DLPROOFS::Point::counter << " exponentiations in "
-        << ((500+DLPROOFS::Point::timer)/1000) << " milliseconds\n";
+    auto verifyLinTicks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+    if (!linOK) std::cout << "failed linear verification\n";
+    std::cout << "verifyLinear in "<<verifyLinTicks<<" milliseconds\n";
 
-    // prove and verify the quadratic statement
-    DLPROOFS::Point::counter = 0;
-    DLPROOFS::Point::timer = 0;
-    auto merQuadVer = merQuad; // another copy for verification
+    // Quadratic bulletproof
+    auto merQuadVer = merQuad;
     DLPROOFS::QuadPfTranscript pfQ("Quadratic");
     pfQ.C = rtp.quadCom;
-     // The actual proof
+
     start = chrono::steady_clock::now();
     DLPROOFS::proveQuadratic(pfQ, rtp.qComRnd, merQuad, rtp.quadGs.data(),
                 rtp.quadWtnsG.data(), rtp.quadHs.data(), rtp.quadWtnsH.data(),
                 rtp.quadGs.size());
     end = chrono::steady_clock::now();
-    ticks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-    std::cout << "proving quadratic in "<<ticks<< " milliseconds, "
-        << DLPROOFS::Point::counter << " exponentiations in "
-        << ((500+DLPROOFS::Point::timer)/1000) << " milliseconds\n";
+    auto proveQuadTicks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+    std::cout << "proveQuadratic in "<<proveQuadTicks<<" milliseconds\n";
 
-    // The actual verification
-    DLPROOFS::Point::counter = 0;
-    DLPROOFS::Point::timer = 0;
     start = chrono::steady_clock::now();
-    if (!DLPROOFS::verifyQuadratic(pfQ, rtv.quadGs.data(), rtv.quadHs.data(),
+    bool quadOK = DLPROOFS::verifyQuadratic(pfQ, rtv.quadGs.data(), rtv.quadHs.data(),
                         rtp.quadGs.size(), rtv.quadCnstr.equalsTo, merQuadVer,
-                        rtv.offstG.data(), rtv.offstH.data()))
-        std::cout << "failed quadratic verification\n";
+                        rtv.offstG.data(), rtv.offstH.data());
     end = chrono::steady_clock::now();
-    ticks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-    std::cout << "verifying quadratic in "<<ticks<< " milliseconds, "
-        << DLPROOFS::Point::counter << " exponentiations in "
-        << ((500+DLPROOFS::Point::timer)/1000) << " milliseconds\n";
+    auto verifyQuadTicks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+    if (!quadOK) std::cout << "failed quadratic verification\n";
+    std::cout << "verifyQuadratic in "<<verifyQuadTicks<<" milliseconds\n";
 
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
     std::cout << " max mem: " << ru.ru_maxrss << " kilobytes\n";
 
-    return 0;
-}
-
-#if 0
-#include <vector>
-#include <iostream>
-#include "bulletproof.hpp"
-
-int main(int, char**) {
-    constexpr size_t pfSize = 13;
-
-    // build a constraint: sum_i ai*bi = b = \sum_bi^2
-    DLPROOFS::LinConstraint cnstrL;
-    for (size_t i=0; i<pfSize; i++) {
-        CRV25519::Scalar& x = cnstrL.terms[i+1].setInteger(i+1);
-        cnstrL.equalsTo += x * x;
+    // Transcript size: ciphertext + linear bulletproof + quadratic bulletproof.
+    {
+        constexpr size_t kPointBytes  = 32;
+        constexpr size_t kScalarBytes = 32;
+        size_t bytesPerElement = ALGEBRA::scalarsPerElement() * ALGEBRA::bytesPerScalar();
+        size_t ctxtSize = (static_cast<size_t>(gpk.kay) + static_cast<size_t>(gpk.enn)) * bytesPerElement;
+        size_t linSize = kPointBytes
+                       + (pfL.Ls.size() + pfL.Rs.size()) * kPointBytes
+                       + kPointBytes
+                       + 2 * kScalarBytes;
+        size_t quadSize = kPointBytes
+                        + (pfQ.Ls.size() + pfQ.Rs.size()) * kPointBytes
+                        + 2 * kPointBytes
+                        + 3 * kScalarBytes;
+        size_t totalBytes = ctxtSize + linSize + quadSize;
+        std::cout << "transcript bytes: ctxt=" << ctxtSize
+                  << ", linProof=" << linSize
+                  << ", quadProof=" << quadSize
+                  << ", total=" << totalBytes
+                  << " (" << (totalBytes / 1024.0) << " KiB)\n";
     }
-    DLPROOFS::PtxtVec& xes = cnstrL.terms;
-    DLPROOFS::LinPfTranscript pfL = proveLinear("blah", cnstrL, xes);
-    std::cout << "linear: "<<verifyLinear(cnstrL, pfL) <<std::endl;
-
-    DLPROOFS::QuadConstraint cnstrQ;
-    for (auto& x : xes) {
-        cnstrQ.indexes.insert(cnstrQ.indexes.end(), x.first);
-        cnstrQ.equalsTo += x.second * x.second;
-    }    
-    DLPROOFS::PtxtVec& ys = cnstrL.terms;
-    DLPROOFS::QuadPfTranscript pfQ = proveQuadratic("blah", cnstrQ, xes, ys);
-    std::cout << "quadratic: "<<verifyQuadratic(cnstrQ, pfQ) <<std::endl;
-
-    std::set<size_t> indexes;
-    for (auto& elem: xes) // elem = {idx:scalar}
-        indexes.insert(indexes.end(), elem.first);
-
-    auto [normSq, prNS] = DLPROOFS::proveNormSquared("blah", xes);
-    std::cout << "norm: "<<verifyNormSquared(indexes,normSq,prNS)<<std::endl;
 
     return 0;
 }
-#endif

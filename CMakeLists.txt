@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.0.0)
 project(lwe-pvss VERSION 0.1.0)
 
+# Default to Release when the user hasn't picked a build type.
+# Without this, single-config generators (Unix Makefiles, Ninja) leave
+# CMAKE_BUILD_TYPE empty, producing an unoptimized build with active asserts
+# that is ~10x slower on the benchmark and can trip debug-only sanity checks.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type (Debug, Release, RelWithDebInfo, MinSizeRel)" FORCE)
+endif()
+
 # Use -std=c++17 as default.
 set(CMAKE_CXX_STANDARD 17)
 

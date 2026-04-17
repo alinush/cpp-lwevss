@@ -100,7 +100,10 @@ GlobalKey::GlobalKey(const std::string tg, const KeyParams &prms, const EMatrix*
         throw std::runtime_error("GlobalKey with invalid parameters");
     }
     tee = ((enn-1)/(2*ell))*ell; // less than n/2, divisible by ell
-    assert(tee>0);       // sanity check
+    // Note: for very small n (e.g., n=4 with ell=2) this formula produces
+    // tee=0. Callers must then override `tee` before use (main.cpp accepts a
+    // CLI argument for that purpose). The validity of `tee` is checked at the
+    // point of use, not here, so that the override path works.
     resize(A,kay,kay);
     resize(B,enn,kay);
 
