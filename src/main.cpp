@@ -36,6 +36,7 @@ using namespace std;
 #include <NTL/version.h>
 #include "regevEnc.hpp"
 #include "regevProofs.hpp"
+#include "bulletproof.hpp"
 
 using namespace ALGEBRA;
 using namespace REGEVENC;
@@ -49,16 +50,24 @@ int main(int argc, char** argv) {
     if (argc > 1) {
         nParties = std::stoi(argv[1]);
     }
-    if (nParties < 32 || nParties > 4096)
-        nParties = 512;
-    std::cout << "nParties="<<nParties << std::endl;
+    // Explicit threshold override (matches blog's t=ceil(2n/3)+1-like values).
+    int tOverride = -1;
+    if (argc > 2) {
+        tOverride = std::stoi(argv[2]);
+    }
+    std::cout << "nParties="<<nParties;
+    if (tOverride > 0) std::cout << " threshold="<<tOverride;
+    std::cout << std::endl;
 
     // The dimensions of the the CRX is k-by-m, but note that this is a
     // matrix over GF(p^2) so the lattice dimensions we get is twice that
     KeyParams kp(nParties);
     // kp.k=64;
     GlobalKey gpk("testContext", kp);
-    std::cout <<"{ kay:"<<gpk.kay<<", enn:"<<gpk.enn
+    if (tOverride > 0) {
+        gpk.tee = tOverride;
+    }
+    std::cout <<"{ kay:"<<gpk.kay<<", enn:"<<gpk.enn<<", tee:"<<gpk.tee
       <<", sigmaEnc1:"<<gpk.sigmaEnc1<<", sigmaEnc2:"<<gpk.sigmaEnc2<<" }\n";
 
     TernaryEMatrix::init();
@@ -146,19 +155,53 @@ int main(int argc, char** argv) {
     // prepare for proof, commit to the secret key
     DLPROOFS::Point::counter = 0;
     DLPROOFS::Point::timer = 0;
-    int origSize = sk[partyIdx].length(); 
-   
+    int origSize = sk[partyIdx].length();
+
+    auto skCommitStart = chrono::steady_clock::now();
     vd.sk1Com = commit(sk[partyIdx], vd.sk1Idx, vd.Gs, pd.sk1Rnd);
+    auto skCommitEnd = chrono::steady_clock::now();
+    auto skCommitTicks = chrono::duration_cast<chrono::milliseconds>(skCommitEnd - skCommitStart).count();
+    std::cout << "commit(sk) in "<< skCommitTicks <<" milliseconds\n";
 
     start = chrono::steady_clock::now();
     SVector lagrange = vd.sp->lagrangeCoeffs(interval(1,gpk.tee+1));
 
+    auto stepStart = chrono::steady_clock::now();
+
     crsTicks = 0;
     proveDecryption(pd, ctxtMat, ctxtVec, ptxt2, sk[partyIdx], decNoise);
+    auto stepEnd = chrono::steady_clock::now();
+    std::cout << "proveDecryption in "
+        << chrono::duration_cast<chrono::milliseconds>(stepEnd - stepStart).count()
+        << " milliseconds\n";
+
+    stepStart = chrono::steady_clock::now();
     proveEncryption(pd, ctxt2.first, ctxt2.second, ptxt3, encRnd, eNoise.first, eNoise.second);
+    stepEnd = chrono::steady_clock::now();
+    std::cout << "proveEncryption in "
+        << chrono::duration_cast<chrono::milliseconds>(stepEnd - stepStart).count()
+        << " milliseconds\n";
+
+    stepStart = chrono::steady_clock::now();
     proveKeyGen(pd, partyIdx, sk[partyIdx], kgNoise[partyIdx]);
+    stepEnd = chrono::steady_clock::now();
+    std::cout << "proveKeyGen in "
+        << chrono::duration_cast<chrono::milliseconds>(stepEnd - stepStart).count()
+        << " milliseconds\n";
+
+    stepStart = chrono::steady_clock::now();
     proveReShare(pd, lagrange, ptxt2, ptxt3);
+    stepEnd = chrono::steady_clock::now();
+    std::cout << "proveReShare in "
+        << chrono::duration_cast<chrono::milliseconds>(stepEnd - stepStart).count()
+        << " milliseconds\n";
+
+    stepStart = chrono::steady_clock::now();
     proveSmallness(pd);
+    stepEnd = chrono::steady_clock::now();
+    std::cout << "proveSmallness in "
+        << chrono::duration_cast<chrono::milliseconds>(stepEnd - stepStart).count()
+        << " milliseconds\n";
 
     end = chrono::steady_clock::now();
     ticks = chrono::duration_cast<chrono::milliseconds>(end - start).count();
@@ -260,6 +303,39 @@ int main(int argc, char** argv) {
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
     std::cout << " max mem: " << ru.ru_maxrss << " kilobytes\n";
+
+    // -------- Transcript size --------
+    // The dealer's PVSS transcript consists of:
+    //   (1) The encrypted dealing ctxt2 = (k-vec A*r, n-vec B*r + m), over GF(P^ell).
+    //   (2) The aggregated linear bulletproof (pfL).
+    //   (3) The aggregated quadratic bulletproof (pfQ).
+    // A Curve25519 Point and Scalar are each 32 bytes; an Element over GF(P^ell)
+    // takes scalarsPerElement() * bytesPerScalar() bytes.
+    {
+        constexpr size_t kPointBytes  = 32;
+        constexpr size_t kScalarBytes = 32;
+        size_t bytesPerElement = ALGEBRA::scalarsPerElement() * ALGEBRA::bytesPerScalar();
+        size_t ctxtSize = (static_cast<size_t>(gpk.kay) + static_cast<size_t>(gpk.enn)) * bytesPerElement;
+
+        // Linear bulletproof: C, S, plus 2*log(n) L/R points, plus scalars a,r.
+        size_t linSize = kPointBytes                                    // C
+                       + (pfL.Ls.size() + pfL.Rs.size()) * kPointBytes  // L_i, R_i
+                       + kPointBytes                                    // S
+                       + 2 * kScalarBytes;                              // a, r
+
+        // Quadratic bulletproof: C, S1, S2, plus 2*log(n) L/R points, plus a,b,r.
+        size_t quadSize = kPointBytes                                   // C
+                        + (pfQ.Ls.size() + pfQ.Rs.size()) * kPointBytes // L_i, R_i
+                        + 2 * kPointBytes                               // S1, S2
+                        + 3 * kScalarBytes;                             // a, b, r
+
+        size_t totalBytes = ctxtSize + linSize + quadSize;
+        std::cout << "transcript bytes: ctxt=" << ctxtSize
+                  << ", linProof=" << linSize
+                  << ", quadProof=" << quadSize
+                  << ", total=" << totalBytes
+                  << " (" << (totalBytes / 1024.0) << " KiB)\n";
+    }
 
     return 0;
 }

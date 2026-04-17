@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/test_shamir.dir/test_shamir.cpp.o -o test_shamir  ../liblwe-pvss.a /opt/homebrew/Cellar/libsodium/1.0.21/lib/libsodium.dylib /opt/homebrew/lib/libntl.dylib /opt/homebrew/lib/libgmp.dylib -lpthread
